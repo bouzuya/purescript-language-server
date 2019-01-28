@@ -110,7 +110,7 @@ main = do
       logError l s = do
         (_.conn <$> unwrap <$> Ref.read state) >>=
           maybe (pure unit) (\conn -> do
-            case l of 
+            case l of
               Success -> log conn s
               Info -> info conn s
               Warning -> warn conn s
@@ -120,7 +120,7 @@ main = do
               Nothing -> pure unit
           )
   let launchAffLog = runAff_ (either (logError Error <<< show) (const $ pure unit))
-      workspaceRoot = do 
+      workspaceRoot = do
         root <- (_.root <<< unwrap) <$> Ref.read state
         maybe cwd pure root
       resolvePath p = workspaceRoot >>= \root -> resolve [ root ] p
@@ -154,11 +154,11 @@ main = do
     root <- case toMaybe rootUri, toMaybe rootPath of
       Just uri, _ -> Just <$> uriToFilename uri
       _, Just path -> pure $ Just path
-      Nothing, Nothing -> pure Nothing 
+      Nothing, Nothing -> pure Nothing
     (\(Tuple dir root) -> log conn ("Starting with cwd: " <> dir <> " and using root path: " <> root)) =<< Tuple <$> cwd <*> workspaceRoot
     Ref.modify_ (over ServerState $ _ { root = root }) state
   Ref.modify_ (over ServerState $ _ { conn = Just conn }) state
-  
+
   documents <- initDocumentStore conn
 
   let showModule :: Module -> String
@@ -166,9 +166,9 @@ main = do
          { moduleName, importType, qualifier } -> moduleName <> maybe "" (" as " <> _) qualifier
 
   let updateModules :: DocumentUri -> Aff Unit
-      updateModules uri = 
-        liftEffect (Ref.read state) >>= case _ of 
-          ServerState { port: Just port, modulesFile } 
+      updateModules uri =
+        liftEffect (Ref.read state) >>= case _ of
+          ServerState { port: Just port, modulesFile }
             | modulesFile /= Just uri -> do
             text <- liftEffect $ getDocument documents uri >>= getText
             path <- liftEffect $ uriToFilename uri
@@ -181,7 +181,7 @@ main = do
         fromAff do
           c <- liftEffect $ Ref.read config
           s <- liftEffect $ Ref.read state
-          maybe (pure unit) updateModules (docUri b)          
+          maybe (pure unit) updateModules (docUri b)
           f c s b
 
   let getTextDocUri :: forall r. { textDocument :: TextDocumentIdentifier | r } -> Maybe DocumentUri
@@ -197,34 +197,43 @@ main = do
   onCodeAction conn $ runHandler "onCodeAction" getTextDocUri (getActions documents)
   onShutdown conn $ fromAff stopPscIdeServer
 
+  let build :: DocumentUri -> Aff Unit
+      build uri = do
+        c <- liftEffect $ Ref.read config
+        s <- liftEffect $ Ref.read state
+        when (Config.fastRebuild c) do
+          liftEffect $ sendDiagnosticsBegin conn
+          { pscErrors, diagnostics } <- getDiagnostics uri c s
+          filename <- liftEffect $ uriToFilename uri
+          let fileDiagnostics = fromMaybe [] $ Object.lookup filename diagnostics
+          liftEffect do
+            log conn $ "Built with " <> show (length pscErrors) <> " issues for file: " <> show filename <> ", all diagnostic files: " <> show (Object.keys diagnostics)
+            Ref.write (over ServerState (\s1 -> s1 {
+              diagnostics = Object.insert (un DocumentUri uri) pscErrors (s1.diagnostics)
+            , modulesFile = Nothing -- Force reload of modules on next request
+            }) s) state
+            publishDiagnostics conn { uri, diagnostics: fileDiagnostics }
+            sendDiagnosticsEnd conn
+
   onDidChangeWatchedFiles conn $ \{ changes } -> do
     for_ changes \(FileEvent { uri, "type": FileChangeTypeCode n }) -> do
       case intToFileChangeType n of
-        Just CreatedChangeType -> log conn $ "Created " <> un DocumentUri uri <> " - full build may be required"
+        Just CreatedChangeType -> launchAffLog do
+          liftEffect $ log conn $ "Created " <> un DocumentUri uri <> " - full build may be required"
+          build uri
+        Just ChangedChangeType -> launchAffLog do
+          liftEffect $ log conn $ "Changed " <> un DocumentUri uri <> " - full build may be required"
+          build uri
         Just DeletedChangeType -> log conn $ "Deleted " <> un DocumentUri uri <> " - full build may be required"
         _ -> pure unit
 
   onDidChangeContent documents $ \_ ->
     liftEffect $ Ref.modify_ (over ServerState (_ { modulesFile = Nothing })) state
 
-  onDidSaveDocument documents \{ document } -> launchAffLog do
-    let uri = getUri document
-    c <- liftEffect $ Ref.read config
-    s <- liftEffect $ Ref.read state
-
-    when (Config.fastRebuild c) do 
-      liftEffect $ sendDiagnosticsBegin conn
-      { pscErrors, diagnostics } <- getDiagnostics uri c s
-      filename <- liftEffect $ uriToFilename uri
-      let fileDiagnostics = fromMaybe [] $ Object.lookup filename diagnostics
-      liftEffect do
-        log conn $ "Built with " <> show (length pscErrors) <> " issues for file: " <> show filename <> ", all diagnostic files: " <> show (Object.keys diagnostics)
-        Ref.write (over ServerState (\s1 -> s1 { 
-          diagnostics = Object.insert (un DocumentUri uri) pscErrors (s1.diagnostics)
-        , modulesFile = Nothing -- Force reload of modules on next request
-        }) s) state
-        publishDiagnostics conn { uri, diagnostics: fileDiagnostics }
-        sendDiagnosticsEnd conn
+  -- onDidSaveDocument documents \{ document } -> launchAffLog do
+  --   let uri = getUri document
+  --   liftEffect $ log conn $ "Saved " <> un DocumentUri uri
+  --   build uri
 
   let onBuild docs c s arguments = do
         liftEffect $ sendDiagnosticsBegin conn
@@ -280,7 +289,7 @@ main = do
   onExecuteCommand conn $ \{ command, arguments } -> fromAff do
     c <- liftEffect $ Ref.read config
     s <- liftEffect $ Ref.read state
-    case Object.lookup command handlers of 
+    case Object.lookup command handlers of
       Just handler -> handler documents c s arguments
       Nothing -> do
         liftEffect $ error conn $ "Unknown command: " <> command
@@ -307,9 +316,9 @@ main = do
 
   Ref.read gotConfig >>= (_ `when` onConfig)
 
-  onDidChangeConfiguration conn $ \{settings} -> do 
+  onDidChangeConfiguration conn $ \{settings} -> do
     log conn "Got updated settings"
-    Ref.write settings config 
+    Ref.write settings config
     Ref.read gotConfig >>= \c -> when (not c) onConfig
 
   log conn "PureScript Language Server started"
